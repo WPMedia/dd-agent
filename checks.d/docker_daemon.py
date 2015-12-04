@@ -241,6 +241,8 @@ class DockerDaemon(AgentCheck):
                 # Initialization failed, will try later
                 return
 
+        self._report_daemon_stats()
+
         # Report image metrics
         if self.collect_image_stats:
             self._count_and_weigh_images()
@@ -264,6 +266,48 @@ class DockerDaemon(AgentCheck):
         # Send events from Docker API
         if self.collect_events:
             self._process_events(containers_by_id)
+
+    def _report_daemon_stats(self):
+        try:
+            tags = self._get_tags()
+            info_data = self.client.info()
+            data_space_used = 0.0
+            data_space_free = 0.0
+            data_space_total = 0.0
+            metadata_space_used = 0.0
+            metadata_space_free = 0.0
+            metadata_space_total = 0.0
+            if 'DriverStatus' in info_data:
+                for driver_metric in info_data['DriverStatus']:
+                    if len(driver_metric) == 2:
+                        metric_name = driver_metric[0]
+                        formatted_value = driver_metric[1]
+                        if metric_name and formatted_value and 'Space' in metric_name:
+                            size_parts = formatted_value.split(' ')
+                            if len(size_parts) == 2:
+                                metric_value = size_parts[0]
+                                if metric_name == 'Data Space Used':
+                                    data_space_used += float(metric_value)
+                                elif metric_name == 'Data Space Available':
+                                    data_space_free += float(metric_value)
+                                elif metric_name == 'Data Space Total':
+                                    data_space_total += float(metric_value)
+                                elif metric_name == 'Metadata Space Used':
+                                    metadata_space_used += float(metric_value)
+                                elif metric_name == 'Metadata Space Available':
+                                    metadata_space_free += float(metric_value)
+                                elif metric_name == 'Metadata Space Total':
+                                    metadata_space_total += float(metric_value)
+
+            self.gauge("docker.info.data_space_used", data_space_used, tags=list(tags))
+            self.gauge("docker.info.data_space_free", data_space_free, tags=list(tags))
+            self.gauge("docker.info.data_space_total", data_space_total, tags=list(tags))
+            self.gauge("docker.info.metadata_space_used", metadata_space_used, tags=list(tags))
+            self.gauge("docker.info.metadata_space_free", metadata_space_free, tags=list(tags))
+            self.gauge("docker.info.metadata_space_total", metadata_space_total, tags=list(tags))
+        except Exception, e:
+            # It's not an important metric, keep going if it fails
+            self.warning("Failed to get Docker daemon stats. Exception: {0}".format(e))
 
     def _count_and_weigh_images(self):
         try:
