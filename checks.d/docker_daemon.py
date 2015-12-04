@@ -268,7 +268,7 @@ class DockerDaemon(AgentCheck):
             self._process_events(containers_by_id)
 
     # Converts 35 GB into 35000000000
-    def _convert_to_bytes(metric_value):
+    def _convert_to_bytes(self, metric_value):
         size_in_bytes = None
         size_parts = metric_value.split(' ')
         if len(size_parts) == 2:
@@ -298,7 +298,7 @@ class DockerDaemon(AgentCheck):
                         metric_name = driver_metric[0]
                         metric_value = driver_metric[1]
                         if metric_name and metric_value and 'Space' in metric_name:
-                            size_in_bytes = _convert_to_bytes(metric_value)
+                            size_in_bytes = self._convert_to_bytes(metric_value)
                             if size_in_bytes != None:
                                 if metric_name == 'Data Space Used':
                                     data_space_used += size_in_bytes
