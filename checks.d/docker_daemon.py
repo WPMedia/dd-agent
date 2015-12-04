@@ -267,6 +267,21 @@ class DockerDaemon(AgentCheck):
         if self.collect_events:
             self._process_events(containers_by_id)
 
+    # Converts 35 GB into 35000000000
+    def _convert_to_bytes(metric_value):
+        size_in_bytes = None
+        size_parts = metric_value.split(' ')
+        if len(size_parts) == 2:
+            size = size_parts[0]
+            units = size_parts[1]
+            if units == 'GB':
+                size_in_bytes = float(size) * 1e+9
+            elif units == 'MB':
+                size_in_bytes = float(size) * 1e+6
+            elif units == 'KB':
+                size_in_bytes = float(size) * 1e+3
+        return size_in_bytes
+
     def _report_daemon_stats(self):
         try:
             tags = self._get_tags()
@@ -281,23 +296,22 @@ class DockerDaemon(AgentCheck):
                 for driver_metric in info_data['DriverStatus']:
                     if len(driver_metric) == 2:
                         metric_name = driver_metric[0]
-                        formatted_value = driver_metric[1]
-                        if metric_name and formatted_value and 'Space' in metric_name:
-                            size_parts = formatted_value.split(' ')
-                            if len(size_parts) == 2:
-                                metric_value = size_parts[0]
+                        metric_value = driver_metric[1]
+                        if metric_name and metric_value and 'Space' in metric_name:
+                            size_in_bytes = _convert_to_bytes(metric_value)
+                            if size_in_bytes != None:
                                 if metric_name == 'Data Space Used':
-                                    data_space_used += float(metric_value)
+                                    data_space_used += size_in_bytes
                                 elif metric_name == 'Data Space Available':
-                                    data_space_free += float(metric_value)
+                                    data_space_free += size_in_bytes
                                 elif metric_name == 'Data Space Total':
-                                    data_space_total += float(metric_value)
+                                    data_space_total += size_in_bytes
                                 elif metric_name == 'Metadata Space Used':
-                                    metadata_space_used += float(metric_value)
+                                    metadata_space_used += size_in_bytes
                                 elif metric_name == 'Metadata Space Available':
-                                    metadata_space_free += float(metric_value)
+                                    metadata_space_free += size_in_bytes
                                 elif metric_name == 'Metadata Space Total':
-                                    metadata_space_total += float(metric_value)
+                                    metadata_space_total += size_in_bytes
 
             self.gauge("docker.info.data_space_used", data_space_used, tags=list(tags))
             self.gauge("docker.info.data_space_free", data_space_free, tags=list(tags))
