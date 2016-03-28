@@ -274,7 +274,9 @@ class DockerDaemon(AgentCheck):
         if len(size_parts) == 2:
             size = size_parts[0]
             units = size_parts[1]
-            if units == 'GB':
+            if units == 'TB':
+                size_in_bytes = float(size) * 1e+12
+            elif units == 'GB':
                 size_in_bytes = float(size) * 1e+9
             elif units == 'MB':
                 size_in_bytes = float(size) * 1e+6
