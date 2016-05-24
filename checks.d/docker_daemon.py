@@ -271,7 +271,7 @@ class DockerDaemon(AgentCheck):
     def _report_daemon_stats(self):
         try:
             tags = self._get_tags()
-            info_data = self.client.info()
+            info_data = self.docker_client.info()
             data_space_used = 0.0
             data_space_free = 0.0
             data_space_total = 0.0
