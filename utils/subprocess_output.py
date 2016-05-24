@@ -1,3 +1,7 @@
+# (C) Datadog, Inc. 2010-2016
+# All rights reserved
+# Licensed under Simplified BSD License (see LICENSE)
+
 # stdlib
 from contextlib import nested
 from functools import wraps
@@ -10,9 +14,11 @@ from utils.platform import Platform
 
 log = logging.getLogger(__name__)
 
+class SubprocessOutputEmptyError(Exception):
+    pass
 
 # FIXME: python 2.7 has a far better way to do this
-def get_subprocess_output(command, log, shell=False, stdin=None):
+def get_subprocess_output(command, log, shell=False, stdin=None, output_expected=True):
     """
     Run the given subprocess command and return it's output. Raise an Exception
     if an error occurs.
@@ -37,6 +43,10 @@ def get_subprocess_output(command, log, shell=False, stdin=None):
 
         stdout_f.seek(0)
         output = stdout_f.read()
+
+    if output_expected and output is None:
+        raise SubprocessOutputEmptyError("get_subprocess_output expected output but had none.")
+
     return (output, err, proc.returncode)
 
 

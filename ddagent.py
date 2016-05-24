@@ -7,7 +7,7 @@
 
     Licensed under Simplified BSD License (see LICENSE)
     (C) Boxed Ice 2010 all rights reserved
-    (C) Datadog, Inc. 2010-2013 all rights reserved
+    (C) Datadog, Inc. 2010-2016 all rights reserved
 '''
 # set up logging before importing any other components
 from config import initialize_logging  # noqa
@@ -56,14 +56,23 @@ from util import (
     json,
     Watchdog,
 )
+from utils.logger import RedactedLogRecord
 
+
+logging.LogRecord = RedactedLogRecord
 log = logging.getLogger('forwarder')
 log.setLevel(get_logging_config()['log_level'] or logging.INFO)
 
 DD_ENDPOINT = "dd_url"
 
+# Transactions
 TRANSACTION_FLUSH_INTERVAL = 5000  # Every 5 seconds
+
+# Watchdog settings
 WATCHDOG_INTERVAL_MULTIPLIER = 10  # 10x flush interval
+WATCHDOG_HIGH_ACTIVITY_THRESHOLD = 1000  # Threshold to detect pathological activity
+
+# Misc
 HEADERS_TO_REMOVE = [
     'Host',
     'Content-Length',
@@ -76,7 +85,7 @@ MAX_WAIT_FOR_REPLAY = timedelta(seconds=90)
 # Maximum queue size in bytes (when this is reached, old messages are dropped)
 MAX_QUEUE_SIZE = 30 * 1024 * 1024  # 30MB
 
-THROTTLING_DELAY = timedelta(microseconds=1000000/2)  # 2 msg/second
+THROTTLING_DELAY = timedelta(microseconds=1000000 / 2)  # 2 msg/second
 
 
 class EmitterThread(threading.Thread):
@@ -203,7 +212,10 @@ class AgentTransaction(Transaction):
     def flush(self):
         for endpoint in self._endpoints:
             url = self.get_url(endpoint)
-            log.debug("Sending %s to endpoint %s at %s" % (self._type, endpoint, url))
+            log.debug(
+                u"Sending %s to endpoint %s at %s",
+                self._type, endpoint, url
+            )
 
             # Getting proxy settings
             proxy_settings = self._application._agentConfig.get('proxy_settings', None)
@@ -260,7 +272,10 @@ class AgentTransaction(Transaction):
     def on_response(self, response):
         if response.error:
             log.error("Response: %s" % response)
-            self._trManager.tr_error(self)
+            if response.code == 413:
+                self._trManager.tr_error_too_big(self)
+            else:
+                self._trManager.tr_error(self)
         else:
             self._trManager.tr_success(self)
 
@@ -353,7 +368,7 @@ class ApiInputHandler(tornado.web.RequestHandler):
 
         if msg is not None:
             # Setup a transaction for this message
-            tr = APIMetricTransaction(msg, headers)
+            APIMetricTransaction(msg, headers)
         else:
             raise tornado.web.HTTPError(500)
 
@@ -395,10 +410,14 @@ class Application(tornado.web.Application):
         if self.skip_ssl_validation:
             log.info("Skipping SSL hostname validation, useful when using a transparent proxy")
 
+        # Monitor activity
         if watchdog:
-            watchdog_timeout = TRANSACTION_FLUSH_INTERVAL * WATCHDOG_INTERVAL_MULTIPLIER
-            self._watchdog = Watchdog(watchdog_timeout,
-                                      max_mem_mb=agentConfig.get('limit_memory_consumption', None))
+            watchdog_timeout = TRANSACTION_FLUSH_INTERVAL * WATCHDOG_INTERVAL_MULTIPLIER / 1000
+            self._watchdog = Watchdog(
+                watchdog_timeout,
+                max_mem_mb=agentConfig.get('limit_memory_consumption', None),
+                max_resets=WATCHDOG_HIGH_ACTIVITY_THRESHOLD
+            )
 
     def log_request(self, handler):
         """ Override the tornado logging method.
@@ -410,9 +429,13 @@ class Application(tornado.web.Application):
             log_method = log.warning
         else:
             log_method = log.error
+
         request_time = 1000.0 * handler.request.request_time()
-        log_method("%d %s %.2fms", handler.get_status(),
-                   handler._request_summary(), request_time)
+        log_method(
+            u"%d %s %.2fms",
+            handler.get_status(),
+            handler._request_summary(), request_time
+        )
 
     def appendMetric(self, prefix, name, host, device, ts, value):
 

@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# pylint: disable=E0401
 #
 # Copyright © 2009-2010 CEA
 # Pierre Raybaut
@@ -115,18 +116,20 @@ log = logging.getLogger(__name__)
 EXCLUDED_WINDOWS_CHECKS = [
     'btrfs',
     'cacti',
-    'directory',
+    'ceph',
     'docker',
+    'docker_daemon',
     'gearmand',
+    'go-metro',
     'gunicorn',
     'hdfs',
     'kafka_consumer',
+    'linux_proc_extras',
     'marathon',
     'mcache',
     'mesos',
     'network',
     'postfix',
-    'ssh_check',
     'zk',
 ]
 
@@ -399,6 +402,7 @@ class HTMLWindow(QTextEdit):
                 platform=platform.platform(),
                 agent_version=get_version(),
                 python_version=platform.python_version(),
+                python_architecture=Platform.python_architecture(),
                 logger_info=logger_info(),
                 dogstatsd=dogstatsd_status.to_dict(),
                 forwarder=forwarder_status.to_dict(),
@@ -829,11 +833,10 @@ def kill_old_process():
     # agent-manager.exe, let's save its pid
     pid = str(os.getpid())
     try:
-        fp = open(pidfile, 'w+')
-        fp.write(str(pid))
-        fp.close()
+        with open(pidfile, 'w+') as fp:
+            fp.write(str(pid))
     except Exception, e:
-        msg = "Unable to write pidfile: %s" % pidfile
+        msg = "Unable to write pidfile: %s %s" % (pidfile, str(e))
         log.exception(msg)
         sys.stderr.write(msg + "\n")
         sys.exit(1)

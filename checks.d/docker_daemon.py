@@ -1,26 +1,30 @@
+# (C) Datadog, Inc. 2010-2016
+# All rights reserved
+# Licensed under Simplified BSD License (see LICENSE)
+
 # stdlib
 import os
 import re
 import requests
-import time
 import socket
 import urllib2
 from collections import defaultdict, Counter, deque
+from math import ceil
 
 # project
 from checks import AgentCheck
 from config import _is_affirmative
-from utils.dockerutil import find_cgroup, find_cgroup_filename_pattern, get_client, MountException, set_docker_settings
-from utils.kubeutil import get_kube_labels
+from utils.dockerutil import DockerUtil, MountException
+from utils.kubeutil import KubeUtil
 from utils.platform import Platform
+from utils.service_discovery.sd_backend import get_sd_backend
 
 
 EVENT_TYPE = 'docker'
 SERVICE_CHECK_NAME = 'docker.service_up'
-SIZE_REFRESH_RATE = 5 # Collect container sizes every 5 iterations of the check
+SIZE_REFRESH_RATE = 5  # Collect container sizes every 5 iterations of the check
 MAX_CGROUP_LISTING_RETRIES = 3
 CONTAINER_ID_RE = re.compile('[0-9a-f]{64}')
-POD_NAME_LABEL = "io.kubernetes.pod.name"
 
 GAUGE = AgentCheck.gauge
 RATE = AgentCheck.rate
@@ -29,6 +33,13 @@ HISTO = AgentCheck.generate_histogram_func(["container_name"])
 FUNC_MAP = {
     GAUGE: {True: HISTO, False: GAUGE},
     RATE: {True: HISTORATE, False: RATE}
+}
+
+UNIT_MAP = {
+    'kb': 1000,
+    'mb': 1000000,
+    'gb': 1000000000,
+    'tb': 1000000000000
 }
 
 CGROUP_METRICS = [
@@ -86,41 +97,13 @@ DEFAULT_IMAGE_TAGS = [
 ]
 
 
-def image_tag_extractor(c, key):
-    if "Image" in c:
-        split = c["Image"].split(":", 1)
-        if len(split) <= key:
-            return None
-        else:
-            return [split[key]]
-    if "RepoTags" in c:
-        splits = [el.split(":", 1) for el in c["RepoTags"]]
-        tags = []
-        for split in splits:
-            if len(split) > key:
-                tags.append(split[key])
-        if len(tags) > 0:
-            return list(set(tags))
-    return None
-
-
-def container_name_extractor(c):
-    # we sort the list to make sure that a docker API update introducing
-    # new names with a single "/" won't make us report dups.
-    names = sorted(c.get('Names', []))
-    for name in names:
-        # the leading "/" is legit, if there's another one it means the name is actually an alias
-        if name.count('/') <= 1:
-            return [str(name).lstrip('/')]
-    return [c.get('Id')[:11]]
-
-
 TAG_EXTRACTORS = {
     "docker_image": lambda c: [c["Image"]],
-    "image_name": lambda c: image_tag_extractor(c, 0),
-    "image_tag": lambda c: image_tag_extractor(c, 1),
+    "image_name": lambda c: DockerUtil.image_tag_extractor(c, 0),
+    "image_tag": lambda c: DockerUtil.image_tag_extractor(c, 1),
     "container_command": lambda c: [c["Command"]],
-    "container_name": container_name_extractor,
+    "container_name": DockerUtil.container_name_extractor,
+    "container_id": lambda c: [c["Id"]],
 }
 
 CONTAINER = "container"
@@ -128,12 +111,6 @@ PERFORMANCE = "performance"
 FILTERED = "filtered"
 IMAGE = "image"
 
-
-def get_mountpoints(docker_root):
-    mountpoints = {}
-    for metric in CGROUP_METRICS:
-        mountpoints[metric["cgroup"]] = find_cgroup(metric["cgroup"], docker_root)
-    return mountpoints
 
 def get_filters(include, exclude):
     # The reasoning is to check exclude first, so we can skip if there is no exclude
@@ -166,27 +143,27 @@ class DockerDaemon(AgentCheck):
 
         self.init_success = False
         self.init()
+        self._service_discovery = agentConfig.get('service_discovery') and \
+            agentConfig.get('service_discovery_backend') == 'docker'
 
     def is_k8s(self):
-        return self.is_check_enabled("kubernetes")
+        return 'KUBERNETES_PORT' in os.environ
 
     def init(self):
         try:
+            instance = self.instances[0]
+
             # We configure the check with the right cgroup settings for this host
             # Just needs to be done once
-            instance = self.instances[0]
-            set_docker_settings(self.init_config, instance)
-
-            self.client = get_client()
-            self._docker_root = self.init_config.get('docker_root', '/')
-            self._mountpoints = get_mountpoints(self._docker_root)
+            self.docker_util = DockerUtil()
+            self.docker_client = self.docker_util.client
+            if self.is_k8s():
+                self.kubeutil = KubeUtil()
+            self._mountpoints = self.docker_util.get_mountpoints(CGROUP_METRICS)
             self.cgroup_listing_retries = 0
             self._latest_size_query = 0
             self._filtered_containers = set()
             self._disable_net_metrics = False
-
-            # At first run we'll just collect the events from the latest 60 secs
-            self._last_event_collection_ts = int(time.time()) - 60
 
             # Set tagging options
             self.custom_tags = instance.get("tags", [])
@@ -200,7 +177,6 @@ class DockerDaemon(AgentCheck):
                 CONTAINER: instance.get("container_tags", DEFAULT_CONTAINER_TAGS),
                 PERFORMANCE: performance_tags,
                 IMAGE: instance.get('image_tags', DEFAULT_IMAGE_TAGS)
-
             }
 
             # Set filtering settings
@@ -215,12 +191,12 @@ class DockerDaemon(AgentCheck):
                 self._exclude_patterns, self._include_patterns, _filtered_tag_names = get_filters(include, exclude)
                 self.tag_names[FILTERED] = _filtered_tag_names
 
-
             # Other options
             self.collect_image_stats = _is_affirmative(instance.get('collect_images_stats', False))
             self.collect_container_size = _is_affirmative(instance.get('collect_container_size', False))
             self.collect_events = _is_affirmative(instance.get('collect_events', True))
             self.collect_image_size = _is_affirmative(instance.get('collect_image_size', False))
+            self.collect_disk_stats = _is_affirmative(instance.get('collect_disk_stats', False))
             self.collect_ecs_tags = _is_affirmative(instance.get('ecs_tags', True)) and Platform.is_ecs_instance()
 
             self.ecs_tags = {}
@@ -251,11 +227,19 @@ class DockerDaemon(AgentCheck):
             self.refresh_ecs_tags()
 
         if self.is_k8s():
-            self.kube_labels = get_kube_labels()
+            try:
+                self.kube_labels = self.kubeutil.get_kube_labels()
+            except Exception as e:
+                self.log.warning('Could not retrieve kubernetes labels: %s' % str(e))
+                self.kube_labels = {}
 
         # Get the list of containers and the index of their names
         containers_by_id = self._get_and_count_containers()
         containers_by_id = self._crawl_container_pids(containers_by_id)
+
+        # Send events from Docker API
+        if self.collect_events or self._service_discovery:
+            self._process_events(containers_by_id)
 
         # Report performance container metrics (cpu, mem, net, io)
         self._report_performance_metrics(containers_by_id)
@@ -263,9 +247,9 @@ class DockerDaemon(AgentCheck):
         if self.collect_container_size:
             self._report_container_size(containers_by_id)
 
-        # Send events from Docker API
-        if self.collect_events:
-            self._process_events(containers_by_id)
+        # Collect disk stats from Docker info command
+        if self.collect_disk_stats:
+            self._report_disk_stats()
 
     # Converts 35 GB into 35000000000
     def _convert_to_bytes(self, metric_value):
@@ -328,9 +312,9 @@ class DockerDaemon(AgentCheck):
     def _count_and_weigh_images(self):
         try:
             tags = self._get_tags()
-            active_images = self.client.images(all=False)
+            active_images = self.docker_client.images(all=False)
             active_images_len = len(active_images)
-            all_images_len = len(self.client.images(quiet=True, all=True))
+            all_images_len = len(self.docker_client.images(quiet=True, all=True))
             self.gauge("docker.images.available", active_images_len, tags=tags)
             self.gauge("docker.images.intermediate", (all_images_len - active_images_len), tags=tags)
 
@@ -352,7 +336,7 @@ class DockerDaemon(AgentCheck):
         all_containers_count = Counter()
 
         try:
-            containers = self.client.containers(all=True, size=must_query_size)
+            containers = self.docker_client.containers(all=True, size=must_query_size)
         except Exception, e:
             message = "Unable to list Docker containers: {0}".format(e)
             self.service_check(SERVICE_CHECK_NAME, AgentCheck.CRITICAL,
@@ -368,7 +352,7 @@ class DockerDaemon(AgentCheck):
         containers_by_id = {}
 
         for container in containers:
-            container_name = container_name_extractor(container)[0]
+            container_name = DockerUtil.container_name_extractor(container)[0]
 
             container_status_tags = self._get_tags(container, CONTAINER)
 
@@ -406,8 +390,8 @@ class DockerDaemon(AgentCheck):
         tags = list(self.custom_tags)
 
         # Collect pod names as tags on kubernetes
-        if self.is_k8s() and POD_NAME_LABEL not in self.collect_labels_as_tags:
-            self.collect_labels_as_tags.append(POD_NAME_LABEL)
+        if self.is_k8s() and KubeUtil.POD_NAME_LABEL not in self.collect_labels_as_tags:
+            self.collect_labels_as_tags.append(KubeUtil.POD_NAME_LABEL)
 
         if entity is not None:
             pod_name = None
@@ -418,22 +402,29 @@ class DockerDaemon(AgentCheck):
                 for k in self.collect_labels_as_tags:
                     if k in labels:
                         v = labels[k]
-                        if k == POD_NAME_LABEL and self.is_k8s():
+                        if k == KubeUtil.POD_NAME_LABEL and self.is_k8s():
                             pod_name = v
                             k = "pod_name"
                             if "-" in pod_name:
                                 replication_controller = "-".join(pod_name.split("-")[:-1])
-                                if "/" in replication_controller:
+                                if "/" in replication_controller: # k8s <= 1.1
                                     namespace, replication_controller = replication_controller.split("/", 1)
-                                    tags.append("kube_namespace:%s" % namespace)
 
+                                elif KubeUtil.NAMESPACE_LABEL in labels: # k8s >= 1.2
+                                    namespace = labels[KubeUtil.NAMESPACE_LABEL]
+                                    pod_name = "{0}/{1}".format(namespace, pod_name)
+
+                                tags.append("kube_namespace:%s" % namespace)
                                 tags.append("kube_replication_controller:%s" % replication_controller)
+                                tags.append("pod_name:%s" % pod_name)
 
-                        if not v:
+                        elif not v:
                             tags.append(k)
+
                         else:
                             tags.append("%s:%s" % (k,v))
-                    if k == POD_NAME_LABEL and self.is_k8s() and k not in labels:
+
+                    if k == KubeUtil.POD_NAME_LABEL and self.is_k8s() and k not in labels:
                         tags.append("pod_name:no_pod")
 
             # Get entity specific tags
@@ -458,7 +449,6 @@ class DockerDaemon(AgentCheck):
                 if kube_tags:
                     tags.extend(list(kube_tags))
 
-
         return tags
 
     def _extract_tag_value(self, entity, tag_name):
@@ -479,7 +469,7 @@ class DockerDaemon(AgentCheck):
         return entity["_tag_values"][tag_name]
 
     def refresh_ecs_tags(self):
-        ecs_config = self.client.inspect_container('ecs-agent')
+        ecs_config = self.docker_client.inspect_container('ecs-agent')
         ip = ecs_config.get('NetworkSettings', {}).get('IPAddress')
         ports = ecs_config.get('NetworkSettings', {}).get('Ports')
         port = ports.keys()[0].split('/')[0] if ports else None
@@ -501,10 +491,9 @@ class DockerDaemon(AgentCheck):
         for container in containers:
             container_tags = self._get_tags(container, FILTERED)
             if self._are_tags_filtered(container_tags):
-                container_name = container_name_extractor(container)[0]
+                container_name = DockerUtil.container_name_extractor(container)[0]
                 self._filtered_containers.add(container_name)
-                self.log.debug("Container {0} is filtered".format(container["Names"][0]))
-
+                self.log.debug("Container {0} is filtered".format(container_name))
 
     def _are_tags_filtered(self, tags):
         if self._tags_match_patterns(tags, self._exclude_patterns):
@@ -525,11 +514,10 @@ class DockerDaemon(AgentCheck):
 
         Requires _filter_containers to run first.
         """
-        container_name = container_name_extractor(container)[0]
+        container_name = DockerUtil.container_name_extractor(container)[0]
         return container_name in self._filtered_containers
 
     def _report_container_size(self, containers_by_id):
-        container_list_with_size = None
         for container in containers_by_id.itervalues():
             if self._is_container_excluded(container):
                 continue
@@ -539,7 +527,7 @@ class DockerDaemon(AgentCheck):
             if "SizeRw" in container:
 
                 m_func(self, 'docker.container.size_rw', container['SizeRw'],
-                    tags=tags)
+                       tags=tags)
             if "SizeRootFs" in container:
                 m_func(
                     self, 'docker.container.size_rootfs', container['SizeRootFs'],
@@ -565,19 +553,18 @@ class DockerDaemon(AgentCheck):
             tags = self._get_tags(container, PERFORMANCE)
             self._report_cgroup_metrics(container, tags)
             if "_proc_root" not in container:
-                containers_without_proc_root.append(container_name_extractor(container)[0])
+                containers_without_proc_root.append(DockerUtil.container_name_extractor(container)[0])
                 continue
             self._report_net_metrics(container, tags)
 
         if containers_without_proc_root:
-            message = "Couldn't find pid directory for container: {0}. They'll be missing network metrics".format(
-                ",".join(containers_without_proc_root))
+            message = "Couldn't find pid directory for containers: {0}. They'll be missing network metrics".format(
+                ", ".join(containers_without_proc_root))
             if not self.is_k8s():
                 self.warning(message)
             else:
                 # On kubernetes, this is kind of expected. Network metrics will be collected by the kubernetes integration anyway
                 self.log.debug(message)
-
 
     def _report_cgroup_metrics(self, container, tags):
         try:
@@ -639,6 +626,10 @@ class DockerDaemon(AgentCheck):
             self.warning("Failed to report IO metrics from file {0}. Exception: {1}".format(proc_net_file, e))
 
     def _process_events(self, containers_by_id):
+        if self.collect_events is False:
+            # Crawl events for service discovery only
+            self._get_events()
+            return
         try:
             api_events = self._get_events()
             aggregated_events = self._pre_aggregate_events(api_events, containers_by_id)
@@ -648,7 +639,7 @@ class DockerDaemon(AgentCheck):
             return
         except Exception, e:
             self.warning("Unexpected exception when collecting events: {0}. "
-                "Events will be missing".format(e))
+                         "Events will be missing".format(e))
             return
 
         for ev in events:
@@ -657,14 +648,9 @@ class DockerDaemon(AgentCheck):
 
     def _get_events(self):
         """Get the list of events."""
-        now = int(time.time())
-        events = []
-        event_generator = self.client.events(since=self._last_event_collection_ts,
-            until=now, decode=True)
-        for event in event_generator:
-            if event != '':
-                events.append(event)
-        self._last_event_collection_ts = now
+        events, should_reload_conf = self.docker_util.get_events()
+        if should_reload_conf and self._service_discovery:
+            get_sd_backend(self.agentConfig).reload_check_configs = True
         return events
 
     def _pre_aggregate_events(self, api_events, containers_by_id):
@@ -672,12 +658,12 @@ class DockerDaemon(AgentCheck):
         events = defaultdict(deque)
         for event in api_events:
             # Skip events related to filtered containers
-            container = containers_by_id.get(event['id'])
+            container = containers_by_id.get(event.get('id'))
             if container is not None and self._is_container_excluded(container):
                 self.log.debug("Excluded event: container {0} status changed to {1}".format(
                     event['id'], event['status']))
                 continue
-            # Known bug: from may be missing
+            # from may be missing (for network events for example)
             if 'from' in event:
                 events[event['from']].appendleft(event)
         return events
@@ -688,15 +674,17 @@ class DockerDaemon(AgentCheck):
             max_timestamp = 0
             status = defaultdict(int)
             status_change = []
-            container_names = set()
+            container_tags = set()
             for event in event_group:
                 max_timestamp = max(max_timestamp, int(event['time']))
                 status[event['status']] += 1
                 container_name = event['id'][:11]
                 if event['id'] in containers_by_id:
-                    container_name = container_name_extractor(containers_by_id[event['id']])[0]
+                    cont = containers_by_id[event['id']]
+                    container_name = DockerUtil.container_name_extractor(cont)[0]
+                    container_tags.update(self._get_tags(cont, PERFORMANCE))
+                    container_tags.add('container_name:%s' % container_name)
 
-                container_names.add(container_name)
                 status_change.append([container_name, event['status']])
 
             status_text = ", ".join(["%d %s" % (count, st) for st, count in status.iteritems()])
@@ -721,10 +709,87 @@ class DockerDaemon(AgentCheck):
                 'msg_text': msg_body,
                 'source_type_name': EVENT_TYPE,
                 'event_object': 'docker:%s' % image_name,
-                'tags': ['container_name:%s' % c_name for c_name in container_names]
+                'tags': list(container_tags)
             })
 
         return events
+
+    def _report_disk_stats(self):
+        """Report metrics about the volume space usage"""
+        stats = {
+            'docker.data.used': None,
+            'docker.data.total': None,
+            'docker.data.free': None,
+            'docker.metadata.used': None,
+            'docker.metadata.total': None,
+            'docker.metadata.free': None
+            # these two are calculated by _calc_percent_disk_stats
+            # 'docker.data.percent': None,
+            # 'docker.metadata.percent': None
+        }
+        info = self.docker_client.info()
+        driver_status = info.get('DriverStatus', [])
+        if not driver_status:
+            self.log.warning('Disk metrics collection is enabled but docker info did not'
+                             ' report any. Your storage driver might not support them, skipping.')
+            return
+        for metric in driver_status:
+            # only consider metrics about disk space
+            if len(metric) == 2 and 'Space' in metric[0]:
+                # identify Data and Metadata metrics
+                mtype = 'data'
+                if 'Metadata' in metric[0]:
+                    mtype = 'metadata'
+
+                if 'Used' in metric[0]:
+                    stats['docker.{0}.used'.format(mtype)] = metric[1]
+                elif 'Space Total' in metric[0]:
+                    stats['docker.{0}.total'.format(mtype)] = metric[1]
+                elif 'Space Available' in metric[0]:
+                    stats['docker.{0}.free'.format(mtype)] = metric[1]
+        stats = self._format_disk_metrics(stats)
+        stats.update(self._calc_percent_disk_stats(stats))
+        tags = self._get_tags()
+        for name, val in stats.iteritems():
+            if val is not None:
+                self.gauge(name, val, tags)
+
+    def _format_disk_metrics(self, metrics):
+        """Cast the disk stats to float and convert them to bytes"""
+        for name, raw_val in metrics.iteritems():
+            if raw_val:
+                val, unit = raw_val.split(' ')
+                # by default some are uppercased others lowercased. That's error prone.
+                unit = unit.lower()
+                try:
+                    val = int(float(val) * UNIT_MAP[unit])
+                    metrics[name] = val
+                except KeyError:
+                    self.log.error('Unrecognized unit %s for disk metric %s. Dropping it.' % (unit, name))
+                    metrics[name] = None
+        return metrics
+
+    def _calc_percent_disk_stats(self, stats):
+        """Calculate a percentage of used disk space for data and metadata"""
+        mtypes = ['data', 'metadata']
+        percs = {}
+        for mtype in mtypes:
+            used = stats.get('docker.{0}.used'.format(mtype))
+            total = stats.get('docker.{0}.total'.format(mtype))
+            free = stats.get('docker.{0}.free'.format(mtype))
+            if used and total and free and ceil(total) < free + used:
+                self.log.error('used, free, and total disk metrics may be wrong, '
+                               'unable to calculate percentage.')
+                return {}
+            try:
+                if isinstance(used, int):
+                    percs['docker.{0}.percent'.format(mtype)] = round(100 * float(used) / float(total), 2)
+                elif isinstance(free, int):
+                    percs['docker.{0}.percent'.format(mtype)] = round(100 * (1.0 - (float(free) / float(total))), 2)
+            except ZeroDivisionError:
+                self.log.error('docker.{0}.total is 0, calculating docker.{1}.percent'
+                               ' is not possible.'.format(mtype, mtype))
+        return percs
 
     # Cgroups
 
@@ -736,7 +801,7 @@ class DockerDaemon(AgentCheck):
             "file": filename,
         }
 
-        return find_cgroup_filename_pattern(self._mountpoints, container_id) % (params)
+        return DockerUtil.find_cgroup_filename_pattern(self._mountpoints, container_id) % (params)
 
     def _parse_cgroup_file(self, stat_file):
         """Parse a cgroup pseudo file for key/values."""
@@ -767,7 +832,7 @@ class DockerDaemon(AgentCheck):
     # proc files
     def _crawl_container_pids(self, container_dict):
         """Crawl `/proc` to find container PIDs and add them to `containers_by_id`."""
-        proc_path = os.path.join(self._docker_root, 'proc')
+        proc_path = os.path.join(self.docker_util._docker_root, 'proc')
         pid_dirs = [_dir for _dir in os.listdir(proc_path) if _dir.isdigit()]
 
         if len(pid_dirs) == 0:
@@ -787,6 +852,11 @@ class DockerDaemon(AgentCheck):
                 path = os.path.join(proc_path, folder, 'cgroup')
                 with open(path, 'r') as f:
                     content = [line.strip().split(':') for line in f.readlines()]
+            except IOError, e:
+                #  Issue #2074
+                self.log.debug("Cannot read %s, "
+                               "process likely raced to finish : %s" %
+                               (path, str(e)))
             except Exception, e:
                 self.warning("Cannot read %s : %s" % (path, str(e)))
                 continue
@@ -799,9 +869,12 @@ class DockerDaemon(AgentCheck):
                 else:
                     continue
 
-                match = CONTAINER_ID_RE.search(cpuacct)
-                if match:
-                    container_id = match.group(0)
+                matches = re.findall(CONTAINER_ID_RE, cpuacct)
+                if matches:
+                    container_id = matches[-1]
+                    if container_id not in container_dict:
+                        self.log.debug("Container %s not in container_dict, it's likely excluded", container_id)
+                        continue
                     container_dict[container_id]['_pid'] = folder
                     container_dict[container_id]['_proc_root'] = os.path.join(proc_path, folder)
             except Exception, e:
