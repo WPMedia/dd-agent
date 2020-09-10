@@ -38,7 +38,7 @@ pymongo==3.2
 # checks.d/ssh_check.py
 winrandom-ctypes
 # Require a compiler because pycrypto is a dep
-paramiko==1.15.2
+paramiko==2.0.9
 
 # checks.d/pgbouncer.py
 # Require libpq
